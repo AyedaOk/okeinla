@@ -555,15 +555,18 @@ def demosaic(rggb_img: torch.Tensor) -> torch.Tensor:
     """
     Transform RGGB (4-ch) image or batch to camRGB colors (3-ch).
     """
-    mono_img: np.ndarray = raw.rggb_to_mono_img(rggb_img)
+    device = rggb_img.device
+    mono_img: np.ndarray = raw.rggb_to_mono_img(rggb_img.detach().cpu().numpy())
     if len(mono_img.shape) == 3:
-        return torch.from_numpy(raw.demosaic(mono_img, {"bayer_pattern": "RGGB"}))
+        return torch.from_numpy(
+            raw.demosaic(mono_img, {"bayer_pattern": "RGGB"})
+        ).to(device)
     new_shape: list[int] = list(mono_img.shape)
     new_shape[-3] = 3
     demosaiced_image: np.ndarray = np.empty_like(mono_img, shape=new_shape)
     for i, img in enumerate(mono_img):
         demosaiced_image[i] = raw.demosaic(mono_img[i], {"bayer_pattern": "RGGB"})
-    return torch.from_numpy(demosaiced_image).to(rggb_img.device)
+    return torch.from_numpy(demosaiced_image).to(device)
 
 
 def dt_proc_img(src_fpath: str, dest_fpath: str, xmp_fpath: str, compression=True):

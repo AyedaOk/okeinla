@@ -94,6 +94,17 @@ class JSONSaver:
     def get_best_step_results(self, akey) -> dict:
         return self.results[self.get_best_step(akey)]
 
+    def truncate_after(self, step: int) -> None:
+        """Discard results and best-value metadata newer than a rollback step."""
+        for result_step in list(self.results):
+            if isinstance(result_step, int) and result_step > step:
+                del self.results[result_step]
+        for key, best_step in list(self.results[self.best_key_str].items()):
+            if best_step > step:
+                del self.results[self.best_key_str][key]
+                self.results["best_val"].pop(key, None)
+        self.write()
+
     def is_empty(self) -> bool:
         """Returns True if there are no saved results."""
         return len(self.results["best_val"]) == 0

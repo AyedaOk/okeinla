@@ -6,7 +6,6 @@ with the same filename as the input image and the extension ".denoised.exr".
 Also save the metrics (and the bitrate if applicable) in a directory named "denoised_images_metrics",
 with the same filename as the input image and the extension ".metrics.yaml".
 
-egrun python tools/denoise_image.py -i /orb/Pictures/ITookAPicture/2023/05/29_LucieHikeLustinYvoirGR126/DSC04011.ARW --config ../../models/rawnind_dc/DCTrainingProfiledRGBToProfiledRGB_3ch_L4096.0_Balle_Balle_dc_prgb_1_/args.yaml  --device
 """
 
 import argparse
@@ -22,6 +21,7 @@ sys.path.append("..")
 from rawnind.libs import abstract_trainer
 from common.libs import pt_losses
 from common.libs import pt_helpers
+from common.libs import libimganalysis
 from rawnind.libs import rawproc
 from rawnind.libs import raw
 
@@ -110,6 +110,15 @@ def load_image(fpath, device) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     return img, rgb_xyz_matrix  # type: ignore
 
 
+def load_iso(fpath, test_obj):
+    if not vars(test_obj).get("iso_conditioning", False):
+        return None
+    iso = libimganalysis.get_iso(fpath)
+    if iso is None:
+        raise ValueError(f"ISO metadata not found in {fpath}")
+    return iso
+
+
 def process_image_base(
     test_obj: abstract_trainer.ImageToImageNN,
     out_img: torch.Tensor,
@@ -170,7 +179,9 @@ def save_image(image, fpath: str, src_fpath: Optional[str] = None):
     assert image.shape[-3] == 3
     if len(image.shape) == 4:
         image = image.squeeze(0)
-    raw.hdr_nparray_to_file(image.numpy(), fpath, "lin_rec2020", src_fpath=src_fpath)
+    raw.hdr_nparray_to_file(
+        image.detach().cpu().numpy(), fpath, "lin_rec2020", src_fpath=src_fpath
+    )
 
 
 def save_metrics(metrics: dict, fpath: str):
@@ -183,7 +194,9 @@ def denoise_image_from_to_fpath(
 ):
     img, rgb_xyz_matrix = load_image(in_img_fpath, device=test_obj.device)
 
-    model_results = test_obj.infer(img, return_dict=False)
+    model_results = test_obj.infer(
+        img, return_dict=False, iso=load_iso(in_img_fpath, test_obj)
+    )
     processed_image = process_image_base(
         test_obj, model_results, rgb_xyz_matrix=rgb_xyz_matrix
     )
@@ -209,12 +222,13 @@ def denoise_image_compute_metrics(
     gt_img: Optional[torch.Tensor] = None,
     metrics: list[str] = [],
     nonlinearities: list[str] = [],
+    iso=None,
 ) -> tuple[torch.Tensor, dict]:
     # if model is pRGB and img is bayer, debayer
     if test_obj.in_channels == 3:
         in_img = bayer_to_prgb(in_img, rgb_xyz_matrix)
     # denoise and proc
-    model_results = test_obj.infer(in_img, return_dict=True)
+    model_results = test_obj.infer(in_img, return_dict=True, iso=iso)
     processed_image = process_image_base(
         test_obj,
         model_results["reconstructed_image"],
@@ -265,6 +279,7 @@ def denoise_image_from_fpath_compute_metrics_and_export(
         metrics=metrics,
         nonlinearities=nonlinearities,
         rgb_xyz_matrix=rgb_xyz_matrix,
+        iso=load_iso(in_img_fpath, test_obj),
     )
     # output
     model_fn = os.path.basename(test_obj.load_path)

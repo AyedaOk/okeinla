@@ -16,7 +16,7 @@ import math
 import time
 import unittest
 from typing import Literal, NamedTuple, Optional, Union
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 import tqdm
 
 import torch
@@ -54,6 +54,24 @@ class RawDatasetOutput(TypedDict):
     mask_crops: torch.BoolTensor
     rgb_xyz_matrix: Optional[torch.Tensor]
     gain: float
+    iso: NotRequired[torch.Tensor]
+
+
+MatchGainMode = Literal["input", "output", "never", "target"]
+TARGET_GAIN_MIN = 0.5
+
+
+def normalize_match_gain(match_gain) -> MatchGainMode:
+    """Map the trainer's string mode (or a legacy bool) to a canonical string.
+
+    True  -> "input"  (historical dataset behavior: scale the noisy input)
+    False -> "output" (no scaling at load; gain passed through for output-side match)
+    """
+    if match_gain is True:
+        return "input"
+    if match_gain is False or match_gain is None:
+        return "output"
+    return match_gain
 
 
 class RawImageDataset:
@@ -541,9 +559,10 @@ class CleanProfiledRGBNoisyBayerImageCropsDataset(
         test: bool = False,
         toy_dataset: bool = False,
         data_pairing: Literal["x_y", "x_x", "y_y"] = "x_y",  # x_y, x_x, y_y
-        match_gain: bool = False,
+        match_gain: Union[bool, MatchGainMode] = "output",
         min_msssim_score: Optional[float] = 0.0,
         max_msssim_score: Optional[float] = 1.0,
+        include_iso: bool = False,
     ):
         """
         content_fpath points to a yaml file containing:
@@ -557,7 +576,8 @@ class CleanProfiledRGBNoisyBayerImageCropsDataset(
         return_data
         """
         super().__init__(num_crops=num_crops, crop_size=crop_size)
-        self.match_gain = match_gain
+        self.match_gain = normalize_match_gain(match_gain)
+        self.include_iso = include_iso
         assert bayer_only
         # contents: list[dict] = utilities.load_yaml(content_fpath)
         for content_fpath in content_fpaths:
@@ -569,6 +589,10 @@ class CleanProfiledRGBNoisyBayerImageCropsDataset(
                     break
                 if not image["is_bayer"]:
                     continue
+                if include_iso and ("iso" not in image or image["iso"] <= 0):
+                    raise ValueError(
+                        f"missing or invalid ISO for input image {image['f_fpath']}"
+                    )
 
                 # check that the image is (/not) reserved for testing
                 if (not test and image["image_set"] in test_reserve) or (
@@ -603,6 +627,16 @@ class CleanProfiledRGBNoisyBayerImageCropsDataset(
                 ):
                     logging.info(
                         f"{type(self).__name__}.__init__: rejected {image['f_fpath']}"
+                    )
+                    continue
+                if (
+                    self.match_gain == "target"
+                    and image.get("raw_gain") is not None
+                    and image["raw_gain"] < TARGET_GAIN_MIN
+                ):
+                    logging.info(
+                        f"{type(self).__name__}.__init__: skipped {image['f_fpath']} "
+                        f"(raw_gain {image['raw_gain']} < {TARGET_GAIN_MIN} in target mode)"
                     )
                     continue
                 image["crops"] = sorted(
@@ -683,8 +717,13 @@ class CleanProfiledRGBNoisyBayerImageCropsDataset(
             # "rgb_xyz_matrix": hardcoded_rgbm  # TODO RM DBG
             "rgb_xyz_matrix": torch.tensor(image["rgb_xyz_matrix"]),
         }
-        if self.match_gain:
+        if self.include_iso:
+            output["iso"] = torch.tensor(float(image["iso"]))
+        if self.match_gain == "input":
             output["y_crops"] *= image["raw_gain"]
+            output["gain"] = 1.0
+        elif self.match_gain == "target":
+            output["x_crops"] = (output["x_crops"] / image["raw_gain"]).clamp(0.0, 1.0)
             output["gain"] = 1.0
         else:
             output["gain"] = image["raw_gain"]
@@ -714,7 +753,7 @@ class CleanProfiledRGBNoisyProfiledRGBImageCropsDataset(
         test: bool = False,
         toy_dataset: bool = False,
         data_pairing: Literal["x_y", "x_x", "y_y"] = "x_y",
-        match_gain: bool = False,
+        match_gain: Union[bool, MatchGainMode] = "output",
         arbitrary_proc_method: bool = False,
         min_msssim_score: Optional[float] = 0.0,
         max_msssim_score: Optional[float] = 1.0,
@@ -729,12 +768,12 @@ class CleanProfiledRGBNoisyProfiledRGBImageCropsDataset(
             - mask_mean
         """
         super().__init__(num_crops=num_crops, crop_size=crop_size)
-        self.match_gain = match_gain
+        self.match_gain = normalize_match_gain(match_gain)
         self.arbitrary_proc_method = arbitrary_proc_method
         if self.arbitrary_proc_method:
             assert (
-                self.match_gain
-            ), f"{type(self).__name__}: arbitrary_proc_method requires match_gain"
+                self.match_gain == "input"
+            ), f"{type(self).__name__}: arbitrary_proc_method requires match_gain == 'input'"
         self.data_pairing = data_pairing
         # contents: list[dict] = utilities.load_yaml(content_fpath)
         for content_fpath in content_fpaths:
@@ -838,8 +877,11 @@ class CleanProfiledRGBNoisyProfiledRGBImageCropsDataset(
             noisy_img = pt_helpers.fpath_to_tensor(crop["f_linrec2020_fpath"])
             whole_img_mask = torch.ones_like(gt_img)
         output = {}
-        if self.match_gain:
+        if self.match_gain == "input":
             noisy_img *= image["rgb_gain"]
+            output["gain"] = 1.0
+        elif self.match_gain == "target":
+            gt_img = (gt_img / image["rgb_gain"]).clamp(0.0, 1.0)
             output["gain"] = 1.0
         else:
             output["gain"] = image["rgb_gain"]
@@ -906,7 +948,7 @@ class CleanProfiledRGBNoisyProfiledRGBImageCropsValidationDataset(
         alignment_max_loss: float = ALIGNMENT_MAX_LOSS,
         mask_mean_min: float = MASK_MEAN_MIN,
         toy_dataset: bool = False,
-        match_gain: bool = False,
+        match_gain: Union[bool, MatchGainMode] = "output",
         arbitrary_proc_method: bool = False,
         data_pairing: Literal["x_y", "x_x", "y_y"] = "x_y",
     ):
@@ -994,8 +1036,11 @@ class CleanProfiledRGBNoisyProfiledRGBImageCropsValidationDataset(
             "gt_fpath": crop["gt_linrec2020_fpath"],
             "y_fpath": crop["f_linrec2020_fpath"],
         }
-        if self.match_gain:
+        if self.match_gain == "input":
             output["y_crops"] *= image["rgb_gain"]
+            output["gain"] = 1.0
+        elif self.match_gain == "target":
+            output["x_crops"] = (output["x_crops"] / image["rgb_gain"]).clamp(0.0, 1.0)
             output["gain"] = 1.0
         else:
             output["gain"] = image["rgb_gain"]
@@ -1028,8 +1073,9 @@ class CleanProfiledRGBNoisyBayerImageCropsValidationDataset(
         alignment_max_loss: float = ALIGNMENT_MAX_LOSS,
         mask_mean_min: float = MASK_MEAN_MIN,
         toy_dataset=False,
-        match_gain: bool = False,
+        match_gain: Union[bool, MatchGainMode] = "output",
         data_pairing: Literal["x_y", "x_x", "y_y"] = "x_y",
+        include_iso: bool = False,
     ):
         super().__init__(
             content_fpaths=content_fpaths,
@@ -1043,6 +1089,7 @@ class CleanProfiledRGBNoisyBayerImageCropsValidationDataset(
             toy_dataset=toy_dataset,
             match_gain=match_gain,
             data_pairing=data_pairing,
+            include_iso=include_iso,
         )
 
     def __getitem__(self, i):
@@ -1101,8 +1148,13 @@ class CleanProfiledRGBNoisyBayerImageCropsValidationDataset(
             "gt_fpath": crop["gt_linrec2020_fpath"],
             "y_fpath": crop["f_bayer_fpath"],
         }
-        if self.match_gain:
+        if self.include_iso:
+            output["iso"] = torch.tensor(float(image["iso"]))
+        if self.match_gain == "input":
             output["y_crops"] *= image["raw_gain"]
+            output["gain"] = 1.0
+        elif self.match_gain == "target":
+            output["x_crops"] = (output["x_crops"] / image["raw_gain"]).clamp(0.0, 1.0)
             output["gain"] = 1.0
         else:
             output["gain"] = image["raw_gain"]
@@ -1124,9 +1176,10 @@ class CleanProfiledRGBNoisyBayerImageCropsTestDataloader(
         alignment_max_loss: float = ALIGNMENT_MAX_LOSS,
         mask_mean_min: float = MASK_MEAN_MIN,
         toy_dataset=False,
-        match_gain: bool = False,
+        match_gain: Union[bool, MatchGainMode] = "output",
         min_msssim_score: Optional[float] = 0.0,
         max_msssim_score: Optional[float] = 1.0,
+        include_iso: bool = False,
     ):
         super().__init__(
             content_fpaths=content_fpaths,
@@ -1141,6 +1194,7 @@ class CleanProfiledRGBNoisyBayerImageCropsTestDataloader(
             match_gain=match_gain,
             min_msssim_score=min_msssim_score,
             max_msssim_score=max_msssim_score,
+            include_iso=include_iso,
         )
         # take dataset of images and add coordinates
 
@@ -1148,6 +1202,7 @@ class CleanProfiledRGBNoisyBayerImageCropsTestDataloader(
         """Yield test images one crop at a time. Replaces __getitem__ s.t. the image is not re-loaded many times."""
         for image in self._dataset:
             rgb_xyz_matrix = torch.tensor(image["rgb_xyz_matrix"])
+            iso = torch.tensor(float(image["iso"])) if self.include_iso else None
             for crop in image["crops"]:
                 gt_img = pt_helpers.fpath_to_tensor(crop["gt_linrec2020_fpath"]).float()
                 noisy_img = pt_helpers.fpath_to_tensor(crop["f_bayer_fpath"]).float()
@@ -1163,8 +1218,11 @@ class CleanProfiledRGBNoisyBayerImageCropsTestDataloader(
                 ].expand(gt_img.shape)
 
                 height, width = gt_img.shape[-2:]
-                if self.match_gain:
+                if self.match_gain == "input":
                     noisy_img *= image["raw_gain"]
+                    out_gain = 1.0
+                elif self.match_gain == "target":
+                    gt_img = (gt_img / image["raw_gain"]).clamp(0.0, 1.0)
                     out_gain = 1.0
                 else:
                     out_gain = image["raw_gain"]
@@ -1173,29 +1231,22 @@ class CleanProfiledRGBNoisyBayerImageCropsTestDataloader(
                     width = width - width % 256
                     if height == 0 or width == 0:
                         continue
-                    yield (
-                        {
-                            "x_crops": gt_img[
-                                ...,
-                                :height,
-                                :width,
-                            ].unsqueeze(0),
-                            "y_crops": noisy_img[
-                                ...,
-                                : height // 2,
-                                : width // 2,
-                            ].unsqueeze(0),
-                            "mask_crops": whole_img_mask[
-                                ...,
-                                :height,
-                                :width,
-                            ].unsqueeze(0),
-                            "rgb_xyz_matrix": rgb_xyz_matrix.unsqueeze(0),
-                            "gt_fpath": crop["gt_linrec2020_fpath"],
-                            "y_fpath": crop["f_bayer_fpath"],
-                            "gain": torch.tensor(out_gain),
-                        }
-                    )
+                    output = {
+                        "x_crops": gt_img[..., :height, :width].unsqueeze(0),
+                        "y_crops": noisy_img[
+                            ..., : height // 2, : width // 2
+                        ].unsqueeze(0),
+                        "mask_crops": whole_img_mask[
+                            ..., :height, :width
+                        ].unsqueeze(0),
+                        "rgb_xyz_matrix": rgb_xyz_matrix.unsqueeze(0),
+                        "gt_fpath": crop["gt_linrec2020_fpath"],
+                        "y_fpath": crop["f_bayer_fpath"],
+                        "gain": torch.tensor(out_gain),
+                    }
+                    if iso is not None:
+                        output["iso"] = iso
+                    yield output
                 else:
                     y = x = 0
                     while y < height:
@@ -1204,29 +1255,30 @@ class CleanProfiledRGBNoisyBayerImageCropsTestDataloader(
                                 y + self.crop_size <= height
                                 and x + self.crop_size <= width
                             ):
-                                yield (
-                                    {
-                                        "x_crops": gt_img[
-                                            ...,
-                                            y : y + self.crop_size,
-                                            x : x + self.crop_size,
-                                        ].unsqueeze(0),
-                                        "y_crops": noisy_img[
-                                            ...,
-                                            y // 2 : y // 2 + self.crop_size // 2,
-                                            x // 2 : x // 2 + self.crop_size // 2,
-                                        ].unsqueeze(0),
-                                        "mask_crops": whole_img_mask[
-                                            ...,
-                                            y : y + self.crop_size,
-                                            x : x + self.crop_size,
-                                        ].unsqueeze(0),
-                                        "rgb_xyz_matrix": rgb_xyz_matrix.unsqueeze(0),
-                                        "gt_fpath": crop["gt_linrec2020_fpath"],
-                                        "y_fpath": crop["f_bayer_fpath"],
-                                        "gain": torch.tensor(out_gain),
-                                    }
-                                )
+                                output = {
+                                    "x_crops": gt_img[
+                                        ...,
+                                        y : y + self.crop_size,
+                                        x : x + self.crop_size,
+                                    ].unsqueeze(0),
+                                    "y_crops": noisy_img[
+                                        ...,
+                                        y // 2 : y // 2 + self.crop_size // 2,
+                                        x // 2 : x // 2 + self.crop_size // 2,
+                                    ].unsqueeze(0),
+                                    "mask_crops": whole_img_mask[
+                                        ...,
+                                        y : y + self.crop_size,
+                                        x : x + self.crop_size,
+                                    ].unsqueeze(0),
+                                    "rgb_xyz_matrix": rgb_xyz_matrix.unsqueeze(0),
+                                    "gt_fpath": crop["gt_linrec2020_fpath"],
+                                    "y_fpath": crop["f_bayer_fpath"],
+                                    "gain": torch.tensor(out_gain),
+                                }
+                                if iso is not None:
+                                    output["iso"] = iso
+                                yield output
                             x += self.crop_size
                         x = 0
                         y += self.crop_size
@@ -1247,7 +1299,7 @@ class CleanProfiledRGBNoisyProfiledRGBImageCropsTestDataloader(
         alignment_max_loss: float = ALIGNMENT_MAX_LOSS,
         mask_mean_min: float = MASK_MEAN_MIN,
         toy_dataset=False,
-        match_gain: bool = False,
+        match_gain: Union[bool, MatchGainMode] = "output",
         arbitrary_proc_method: bool = False,
         min_msssim_score: Optional[float] = 0.0,
         max_msssim_score: Optional[float] = 1.0,
@@ -1286,8 +1338,11 @@ class CleanProfiledRGBNoisyProfiledRGBImageCropsTestDataloader(
                     crop["coordinates"][0] : crop["coordinates"][0] + gt_img.shape[2],
                 ].expand(gt_img.shape)
                 height, width = gt_img.shape[-2:]
-                if self.match_gain:
+                if self.match_gain == "input":
                     noisy_img *= image["rgb_gain"]
+                    out_gain = 1.0
+                elif self.match_gain == "target":
+                    gt_img = (gt_img / image["rgb_gain"]).clamp(0.0, 1.0)
                     out_gain = 1.0
                 else:
                     out_gain = image["rgb_gain"]

@@ -1,0 +1,8 @@
+arch: nafnet
+funit: 32
+in_channels: 4
+preupsample: false
+iso_conditioning: false
+match_gain: output
+transfer_function: None
+expname: okeinla-1.0

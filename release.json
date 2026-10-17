@@ -1,0 +1,63 @@
+{
+  "name": "Okeinla",
+  "version": "1.0",
+  "author": "Ayeda Okambawa",
+  "checkpoint_step": 2940000,
+  "checkpoint_sha256": "93f90d2d20edef1035291adebcfe8833a7778a30b8395610ccf19d475ea362fc",
+  "onnx_sha256": "76077c2312cae19eb87aa7f5c6879d29324f556d4ba06ed36c50c1f021cc9c7c",
+  "upstream_repository": "https://github.com/trougnouf/rawnind_jddc",
+  "upstream_base": "4d455aa",
+  "hugging_face_model_url": "https://huggingface.co/AyedaOk/okeinla",
+  "hugging_face_status": "private repository",
+  "rawlab_model_url": "https://huggingface.co/AyedaOk/rawlab-models",
+  "model_license": "GPL-3.0-only",
+  "dataset_name": "Okeinla dataset",
+  "dataset_license": "CC-BY-SA-4.0",
+  "architecture": "nafnet",
+  "width": 32,
+  "parameters": 29162604,
+  "dtype": "float32",
+  "input_shape": [
+    1,
+    4,
+    512,
+    512
+  ],
+  "output_shape": [
+    1,
+    3,
+    1024,
+    1024
+  ],
+  "output_colour": "camera RGB",
+  "adapter": "rawnind-bayer-v1",
+  "bayer_orientation": "force_rggb",
+  "edge_pad": "mirror_cropped",
+  "wb_norm": "none",
+  "output_scale": "match_gain",
+  "onnx_opset": 20,
+  "training_lineage": [
+    {
+      "stage": "M5B",
+      "selected_step": 2915000,
+      "config": "src/rawnind/config/m5b_nafnet32_rawforge_mixed.yaml"
+    },
+    {
+      "stage": "M8",
+      "selected_step": 2925000,
+      "config": "src/rawnind/config/m8_nafnet32_rawforge_detail_seed2026.yaml"
+    },
+    {
+      "stage": "M8 continuation",
+      "selected_step": 2940000,
+      "run_target_step": 2950000,
+      "config": "src/rawnind/config/m8_nafnet32_rawforge_detail_continue_seed2026.yaml"
+    }
+  ],
+  "reproduction_limits": [
+    "Okeinla dataset v1 and trainable checkpoints await publication",
+    "Historical nominal checkpoint steps are not optimizer update counts",
+    "M5B involved resumes and optimizer resets; no bitwise retraining claim"
+  ],
+  "hugging_face_revision": "5a4d9d9ff707634f9edda17a8cd5388921bd6ad0"
+}

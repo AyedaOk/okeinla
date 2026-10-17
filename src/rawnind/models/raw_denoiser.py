@@ -52,6 +52,7 @@ class UtNet2(Denoiser):
         funit: int = 32,
         activation: str = "LeakyReLU",
         preupsample: bool = False,
+        conditioning_channels: int = 0,
     ):
         super().__init__(in_channels=in_channels)
         assert (in_channels == 3 and not preupsample) or in_channels == 4
@@ -63,8 +64,9 @@ class UtNet2(Denoiser):
             )
         else:
             self.preprocess = torch.nn.Identity()
+        self.conditioning_channels = conditioning_channels
         self.convs1 = nn.Sequential(
-            nn.Conv2d(in_channels, funit, 3, padding=1),
+            nn.Conv2d(in_channels + conditioning_channels, funit, 3, padding=1),
             activation_fun(**activation_params),
             nn.Conv2d(funit, funit, 3, padding=1),
             activation_fun(**activation_params),
@@ -139,8 +141,26 @@ class UtNet2(Denoiser):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         # TODO try xavier_normal_ ?
 
-    def forward(self, l):
+    def forward(self, l, conditioning=None):
         l1 = self.preprocess(l)
+        if self.conditioning_channels:
+            if conditioning is None:
+                raise ValueError("conditioning tensor is required")
+            if conditioning.ndim == 1:
+                conditioning = conditioning[:, None, None, None]
+            elif conditioning.ndim == 2:
+                conditioning = conditioning[:, :, None, None]
+            if conditioning.shape[:2] != (l1.shape[0], self.conditioning_channels):
+                raise ValueError(
+                    f"expected conditioning shape [B, {self.conditioning_channels}], "
+                    f"got {tuple(conditioning.shape)}"
+                )
+            conditioning = conditioning.to(device=l1.device, dtype=l1.dtype).expand(
+                -1, -1, l1.shape[-2], l1.shape[-1]
+            )
+            l1 = torch.cat((l1, conditioning), dim=1)
+        elif conditioning is not None:
+            raise ValueError("model was created without conditioning channels")
         # l = self.pad(l)
         l1 = self.convs1(l1)
         l2 = self.convs2(self.maxpool(l1))

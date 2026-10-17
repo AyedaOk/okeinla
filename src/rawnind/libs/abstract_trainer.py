@@ -8,17 +8,21 @@ TODO test
 """
 
 import itertools
+import glob
 import logging
 import os
 import platform
 import random
+import signal
 import shutil
 import statistics
 import sys
+import threading
 import time
 from typing import Callable, Iterable, Optional
 
 import configargparse
+import numpy as np
 import psutil
 import torch
 import tqdm
@@ -34,21 +38,18 @@ from common.tools import save_src
 from rawnind.libs import raw
 from rawnind.libs import rawds
 from rawnind.libs import rawproc
-from rawnind.models import bm3d_denoiser
-
-# from rawnind.extmodels import runet
-# from rawnind.extmodels import edsr
-from rawnind.models import (
-    manynets_compression,
-    compression_autoencoders,
-    denoise_then_compress,
-    standard_compressor,
-)
 from rawnind.models import raw_denoiser
+from rawnind.models import nafnet
 from rawnind.tools import find_best_expname_iteration
 
 # from rawnind.tools.make_openexr_extraraw_files import EXTRARAW_DATA_DPATH
 BREAKPOINT_ON_ERROR = False
+
+
+def seed_dataloader_worker(_worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def error_handler():
@@ -85,13 +86,14 @@ class ImageToImageNN:
         )  # needed here because _get_resume_suffix uses self.loss
         self.autocomplete_args(args)
         self.__dict__.update(vars(args))
+        self.configure_reproducibility(args.seed, args.deterministic)
         if not hasattr(self, "test_only"):
             self.test_only = kwargs.get("test_only", False)
         if not self.test_only:
             self.save_args(args)
         self.save_cmd()
         self.device = pt_helpers.get_device(args.device)
-        if "cuda" in str(self.device):
+        if "cuda" in str(self.device) and not args.deterministic:
             torch.backends.cudnn.benchmark = True  # type: ignore
         # torch.autograd.set_detect_anomaly(True)
         self.__dict__.update(kwargs)
@@ -99,16 +101,24 @@ class ImageToImageNN:
         # get logger
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
+        log_fpath = os.path.join(
+            self.save_dpath, f"{'test' if self.test_only else 'train'}.log"
+        )
         logging.basicConfig(
-            filename=os.path.join(
-                self.save_dpath, f"{'test' if self.test_only else 'train'}.log"
-            ),
+            filename=log_fpath,
             datefmt="%Y-%m-%d %H:%M:%S",
             format="%(asctime)s %(levelname)-8s %(message)s",
             level=logging.DEBUG if self.debug_options else logging.INFO,
-            filemode="w",
+            filemode="a" if self.init_step > 0 and os.path.isfile(log_fpath) else "w",
         )
-        logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)-8s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logging.getLogger().addHandler(console_handler)
         logging.info(" ".join(sys.argv))
         logging.info(f"PID: {os.getpid()}")
         logging.info(f"{self.__dict__=}")
@@ -132,6 +142,20 @@ class ImageToImageNN:
         self.metrics = metrics
 
     @staticmethod
+    def configure_reproducibility(seed: Optional[int], deterministic: bool) -> None:
+        if deterministic and seed is None:
+            raise ValueError("deterministic training requires --seed")
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+        torch.use_deterministic_algorithms(deterministic)
+        torch.backends.cudnn.deterministic = deterministic
+        if deterministic:
+            torch.backends.cudnn.benchmark = False
+
+    @staticmethod
     def load_model(model: torch.nn.Module, path: str, device=None) -> None:
         if os.path.isfile(path):
             model.load_state_dict(torch.load(path, map_location=device))
@@ -144,6 +168,7 @@ class ImageToImageNN:
         self,
         img: torch.Tensor,
         return_dict=False,  # , rgb_xyz_matrix=None, ret_img_only=False, match_gains=True
+        iso=None,
     ) -> dict:
         """Return a denoised image (or {reconstructed_image, bpp} if return_dict is True)."""
         with torch.no_grad():
@@ -157,7 +182,8 @@ class ImageToImageNN:
             # img = pt_ops.crop_to_multiple(img, 16)
             # if rgb_xyz_matrix is not None:
             #     rgb_xyz_matrix = rgb_xyz_matrix.to(self.device)
-            output = self.model.eval()(img)
+            self.model.eval()
+            output = self.forward_model(img, {"iso": iso} if iso is not None else None)
             if return_dict:
                 if isinstance(output, torch.Tensor):
                     return {"reconstructed_image": output}
@@ -174,6 +200,9 @@ class ImageToImageNN:
         #     return output_img.to(orig_device)
         # output["proc_img"] = output_img.to(orig_device)
         return output
+
+    def forward_model(self, img: torch.Tensor, batch=None):
+        return self.model(img)
 
     @staticmethod
     def get_best_step(
@@ -225,16 +254,9 @@ class ImageToImageNN:
         )
         cmd = "python " + " ".join(sys.argv)
 
-        # Read the current cmd.sh file and comment every line
-        with open(out_fpath, "w+") as f:
-            lines = f.readlines()
-            f.seek(0)  # Move the file pointer to the beginning of the file
-
-            # Write the modified lines
-            for line in lines:
-                f.write("# " + line)
-
-            # Write the current cmd at the end of the file
+        with open(out_fpath, "a") as f:
+            if f.tell():
+                f.write("\n")
             f.write(cmd)
 
     def get_args(self, ignore_unknown_args: bool = False):
@@ -295,6 +317,12 @@ class ImageToImageNN:
         parser.add_argument(
             "--device", type=int, help="CUDA device number (-1 for CPU)"
         )
+        parser.add_argument("--seed", type=int, help="Random seed")
+        parser.add_argument(
+            "--deterministic",
+            action="store_true",
+            help="Use deterministic PyTorch algorithms (slower)",
+        )
         parser.add_argument(  # ideally we'd have two sets of debug options for test/train, but oh well
             "--debug_options",
             nargs="*",
@@ -322,7 +350,7 @@ class ImageToImageNN:
             "--match_gain",
             help="When to match gains wrt ground-truth.",
             required=True,
-            choices=["input", "output", "never"],
+            choices=["input", "output", "never", "target"],
         )
 
     def autocomplete_args(self, args):
@@ -459,8 +487,6 @@ class ImageToImageNN:
             and self.test_only
             and "/scratch/" in vars(args).get("noise_dataset_yamlfpaths", "")
         ):
-            # FIXME this doesn't always work, eg "tools/validate_and_test_dc_prgb2prgb.py --config /orb/benoit_phd/models/rawnind_dc/DCTrainingProfiledRGBToProfiledRGB_3ch_L64.0_Balle_Balle_2023-10-27-dc_prgb_msssim_mgout_64from128_x_x_/args.yaml --device -1
-            # when noise_dataset_yamlfpaths is not overwritten through preset_args
             args.noise_dataset_yamlfpaths = [rawproc.RAWNIND_CONTENT_FPATH]
         # args.load_key_metric = f"val_{self._get_resume_suffix()}"  # this would have been nice for tests to have but not implemented on time
 
@@ -478,10 +504,15 @@ class ImageToImageNNTraining(ImageToImageNN):
             return
 
         super().__init__(**kwargs)
+        self.stop_requested = False
+        self.stop_signal = None
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, self.request_stop)
+            signal.signal(signal.SIGINT, self.request_stop)
         # reset the logging basicConfig in case it's been called before
 
         self.init_optimizer()
-        if self.load_path and (
+        if self.load_path and not self.reset_optimizer and (
             self.init_step > 0 or not self.reset_optimizer_on_fallback_load_path
         ):
             self.load_model(self.optimizer, self.load_path + ".opt", device=self.device)
@@ -491,6 +522,22 @@ class ImageToImageNNTraining(ImageToImageNN):
         self.json_saver = json_saver.YAMLSaver(
             res_fpath, warmup_nsteps=self.warmup_nsteps
         )
+        if self.load_path:
+            self.json_saver.truncate_after(self.init_step)
+            for cached_result in glob.glob(
+                os.path.join(self.save_dpath, "val", "iter_*.yaml")
+            ):
+                try:
+                    cached_step = int(
+                        os.path.basename(cached_result)
+                        .removeprefix("iter_")
+                        .removesuffix(".yaml")
+                    )
+                except ValueError:
+                    continue
+                if cached_step > self.init_step:
+                    os.remove(cached_result)
+                    logging.info("Removed stale validation cache %s", cached_result)
         logging.info(f"See {res_fpath} for results.")
 
         # get training data
@@ -501,10 +548,22 @@ class ImageToImageNNTraining(ImageToImageNN):
         self.transfer = self.get_transfer_function(self.transfer_function)
         self.transfer_vt = self.get_transfer_function(self.transfer_function_valtest)
 
+    def request_stop(self, signum, _frame=None) -> None:
+        if not self.stop_requested:
+            logging.warning(
+                f"received signal {signum}; checkpointing after current optimizer step"
+            )
+        self.stop_requested = True
+        self.stop_signal = signum
+
     def autocomplete_args(self, args):
         super().autocomplete_args(args)
         if not args.val_crop_size:
             args.val_crop_size = args.test_crop_size
+        if args.val_reserve is None:
+            args.val_reserve = args.test_reserve
+        elif set(args.val_reserve) & set(args.test_reserve):
+            raise ValueError("val_reserve and test_reserve must contain different scenes")
 
     def init_optimizer(self):
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.init_lr)
@@ -523,11 +582,6 @@ class ImageToImageNNTraining(ImageToImageNN):
             old_lr = self.optimizer.param_groups[0]["lr"]
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] *= self.lr_multiplier
-            self.optimizer.param_groups[0][
-                "lr"
-            ] *= (
-                self.lr_multiplier
-            )  # FIXME/BUG rm this duplicate multiplication. Currently lr_multiplier is squared as a result
             # there is an assertion that len=1 in init
             logging.info(
                 f"adjust_lr: {old_lr} -> {self.optimizer.param_groups[0]['lr']}"
@@ -556,6 +610,11 @@ class ImageToImageNNTraining(ImageToImageNN):
         parser.add_argument(
             "--reset_lr",
             help="Reset learning rate of loaded model. (Defaults to true if fallback_load_path is set and init_step is 0)",
+            action="store_true",
+        )
+        parser.add_argument(
+            "--reset_optimizer",
+            help="Initialize a fresh optimizer when loading a model checkpoint.",
             action="store_true",
         )
         parser.add_argument(
@@ -588,6 +647,11 @@ class ImageToImageNNTraining(ImageToImageNN):
             "--val_crop_size",
             type=int,
             help="Validation (single-image) crop size. default uses test_crop_size",
+        )
+        parser.add_argument(
+            "--val_reserve",
+            nargs="*",
+            help="Name of images which should be reserved for validation. Defaults to test_reserve for compatibility.",
         )
         parser.add_argument(
             "--test_reserve",
@@ -852,7 +916,7 @@ class ImageToImageNNTraining(ImageToImageNN):
                 mask_crops = batch["mask_crops"].to(self.device)
                 # print(batch["y_crops"].shape)
                 try:
-                    model_output = self.model(y_crops)
+                    model_output = self.forward_model(y_crops, batch)
                     if isinstance(model_output, dict):
                         reconstructed_image, bpp = (
                             model_output["reconstructed_image"],
@@ -978,29 +1042,38 @@ class ImageToImageNNTraining(ImageToImageNN):
             self.best_validation_losses: dict[str, float] = {
                 ln: 9001 for ln in validation_losses
             }
+            self.lr_adjustment_allowed_step = self.step_n + self.patience
         else:
             logging.info(f"training_loop: {self.step_n=}, {validation_losses=}")
-            self.json_saver.add_res(
-                self.step_n,
-                {
-                    f"val_{lossn + self._get_lossn_extension()}": lossv
-                    for lossn, lossv in validation_losses.items()
-                },
+            validation_results = {
+                f"val_{lossn + self._get_lossn_extension()}": lossv
+                for lossn, lossv in validation_losses.items()
+            }
+            self.json_saver.add_res(self.step_n, validation_results)
+            self.best_validation_losses = {
+                lossn: self.json_saver.results["best_val"][
+                    f"val_{lossn + self._get_lossn_extension()}"
+                ]
+                for lossn in validation_losses
+            }
+            validation_best_steps = [
+                self.json_saver.results["best_step"][key]
+                for key in validation_results
+                if key in self.json_saver.results["best_step"]
+            ]
+            self.lr_adjustment_allowed_step = (
+                max(validation_best_steps, default=self.step_n) + self.patience
             )
-            self.best_validation_losses = (
-                validation_losses  # validation_losses[self.loss]
-            )
-        self.validate_or_test(
-            dataloader=self.cleannoisy_test_dataloader,
-            sanity_check=True,
-            test_name="sanitytest",
-        )
-        torch.cuda.empty_cache()
         # training loop
-        while self.step_n <= self.tot_steps:
+        while self.step_n < self.tot_steps:
+            if self.stop_requested:
+                logging.warning(f"stop requested at step {self.step_n}; saving checkpoint")
+                self.save_model(self.step_n)
+                return
             num_training_steps = min(
                 self.val_interval + last_val_step - self.step_n,
                 self.test_interval + last_test_step - self.step_n,
+                self.tot_steps - self.step_n,
             )
             if "spam" in self.debug_options:
                 logging.debug(f"{num_training_steps=} to do")
@@ -1010,14 +1083,40 @@ class ImageToImageNNTraining(ImageToImageNN):
                 dataloader_cc=self.cleanclean_dataloader,
                 dataloader_cn=self.cleannoisy_dataloader,
             )
-            self.step_n += num_training_steps
+            completed_training_steps = self.last_num_training_steps
+            if completed_training_steps == 0:
+                logging.warning(
+                    f"stop requested at step {self.step_n}; saving checkpoint"
+                )
+                self.save_model(self.step_n)
+                return
+            pass_capacity = min(
+                num_training_steps,
+                len(self.cleanclean_dataloader),
+                len(self.cleannoisy_dataloader),
+            )
+            nominal_training_steps = self.get_nominal_training_steps(
+                requested_steps=num_training_steps,
+                completed_updates=completed_training_steps,
+                pass_capacity=pass_capacity,
+                interrupted=self.stop_requested,
+            )
+            self.step_n += nominal_training_steps
             logging.info(
-                f"training_loop: {self.step_n=}, {training_loss=} (over {num_training_steps=})"
+                f"training_loop: {self.step_n=}, {training_loss=} "
+                f"(optimizer_updates={completed_training_steps}, "
+                f"nominal_steps={nominal_training_steps})"
             )
             self.json_saver.add_res(
                 self.step_n,
                 {f"train_{self.loss}": training_loss},
             )
+            if self.stop_requested:
+                logging.warning(
+                    f"stop requested; saving model and optimizer at step {self.step_n}"
+                )
+                self.save_model(self.step_n)
+                return
             if self.step_n >= last_val_step + self.val_interval:
                 validation_losses = self.validate_or_test(
                     dataloader=self.cleannoisy_val_dataloader, test_name="val"
@@ -1052,9 +1151,31 @@ class ImageToImageNNTraining(ImageToImageNN):
             self.save_model(self.step_n)
             # TODO: if validation_loss[self.loss] > self.failure_threshold:  reset
 
+    @staticmethod
+    def get_nominal_training_steps(
+        requested_steps: int,
+        completed_updates: int,
+        pass_capacity: int,
+        interrupted: bool,
+    ) -> int:
+        """Preserve historical step labels while checkpointing partial passes."""
+        if completed_updates <= 0:
+            return 0
+        if not interrupted:
+            return requested_steps
+        if pass_capacity <= 0:
+            raise ValueError("training pass capacity must be positive")
+        return max(1, round(requested_steps * completed_updates / pass_capacity))
+
     def get_dataloaders(self) -> None:
         """Instantiate the train/val/test data-loaders into self."""
         class_specific_arguments = {}
+        learn_validation = "learn_validation" in self.debug_options
+        training_reserve = (
+            self.val_reserve
+            if learn_validation
+            else list(dict.fromkeys((*self.val_reserve, *self.test_reserve)))
+        )
         if self.arbitrary_proc_method:
             class_specific_arguments["arbitrary_proc_method"] = (
                 self.arbitrary_proc_method
@@ -1086,6 +1207,10 @@ class ImageToImageNNTraining(ImageToImageNN):
             # content_fpath, crop_size, test_reserve
             # )
             self.color_converter = cleannoisy_dataset_class.camRGB_to_profiledRGB_img
+            if vars(self).get("iso_conditioning", False):
+                if not self.test_only and self.batch_size_clean != 0:
+                    raise ValueError("ISO conditioning requires batch_size_clean: 0")
+                class_specific_arguments["include_iso"] = True
         else:
             raise ValueError(f"{self.in_channels=}")
 
@@ -1101,12 +1226,12 @@ class ImageToImageNNTraining(ImageToImageNN):
                     content_fpaths=self.noise_dataset_yamlfpaths,
                     num_crops=self.num_crops_per_image,
                     crop_size=self.crop_size,
-                    test_reserve=self.test_reserve,
-                    test="learn_validation" in self.debug_options,
+                    test_reserve=training_reserve,
+                    test=learn_validation,
                     bayer_only=self.bayer_only,
                     toy_dataset="toy_dataset" in self.debug_options,
                     data_pairing=self.data_pairing,
-                    match_gain=self.match_gain == "input",
+                    match_gain=self.match_gain,
                     **class_specific_arguments,
                 )
                 cleanclean_dataset = cleannoisy_dataset
@@ -1141,12 +1266,12 @@ class ImageToImageNNTraining(ImageToImageNN):
                     content_fpaths=self.noise_dataset_yamlfpaths,
                     num_crops=self.num_crops_per_image,
                     crop_size=self.crop_size,
-                    test_reserve=self.test_reserve,
-                    test="learn_validation" in self.debug_options,
+                    test_reserve=training_reserve,
+                    test=learn_validation,
                     bayer_only=self.bayer_only,
                     toy_dataset="toy_dataset" in self.debug_options,
                     data_pairing=self.data_pairing,
-                    match_gain=self.match_gain == "input",
+                    match_gain=self.match_gain,
                     **class_specific_arguments,
                 )
 
@@ -1169,6 +1294,8 @@ class ImageToImageNNTraining(ImageToImageNN):
                 shuffle=True,
                 pin_memory=True,
                 num_workers=num_threads_cc,
+                worker_init_fn=seed_dataloader_worker if self.seed is not None else None,
+                generator=self._make_dataloader_generator(0),
             )
             self.cleannoisy_dataloader = torch.utils.data.DataLoader(
                 dataset=cleannoisy_dataset,
@@ -1176,16 +1303,18 @@ class ImageToImageNNTraining(ImageToImageNN):
                 shuffle=True,
                 pin_memory=True,
                 num_workers=num_threads_cn,
+                worker_init_fn=seed_dataloader_worker if self.seed is not None else None,
+                generator=self._make_dataloader_generator(1),
             )
         # FIXME put back tab
         start_time = time.time()
         cleannoisy_val_dataset = val_dataset_class(
             content_fpaths=self.noise_dataset_yamlfpaths,
             crop_size=self.val_crop_size,
-            test_reserve=self.test_reserve,
+            test_reserve=self.val_reserve,
             bayer_only=self.bayer_only,
             toy_dataset="toy_dataset" in self.debug_options,
-            match_gain=self.match_gain == "input",
+            match_gain=self.match_gain,
             data_pairing=self.data_pairing,
             **class_specific_arguments,
         )
@@ -1203,13 +1332,20 @@ class ImageToImageNNTraining(ImageToImageNN):
                 test_reserve=self.test_reserve,
                 bayer_only=self.bayer_only,
                 toy_dataset="toy_dataset" in self.debug_options,
-                match_gain=self.match_gain == "input",
+                match_gain=self.match_gain,
                 **class_specific_arguments,
             )
         except FileNotFoundError as e:
             raise FileNotFoundError(
                 f'{e}. Try running with "--noise_dataset_yamlfpaths {rawproc.RAWNIND_CONTENT_FPATH}"?'
             )
+
+    def _make_dataloader_generator(self, offset: int) -> Optional[torch.Generator]:
+        if self.seed is None:
+            return None
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + offset)
+        return generator
 
     def save_model(self, step: int) -> None:
         fpath = os.path.join(self.save_dpath, "saved_models", f"iter_{step}.pt")
@@ -1248,9 +1384,12 @@ class ImageToImageNNTraining(ImageToImageNN):
         last_time = time.time()
         # for i, batch in enumerate(
         step_losses: list[float] = []
+        self.last_num_training_steps = 0
         first_step: bool = True
         i: int = 0
         for batch in itertools.islice(zip(dataloader_cc, dataloader_cn), 0, num_steps):
+            if self.stop_requested:
+                break
             if "timing" in self.debug_options or "spam" in self.debug_options:
                 logging.debug(f"data {i} loading time: {time.time() - last_time}")
                 last_time: float = time.time()
@@ -1264,12 +1403,13 @@ class ImageToImageNNTraining(ImageToImageNN):
                     ),
                 )
             )
+            self.last_num_training_steps += 1
             if "timing" in self.debug_options or "spam" in self.debug_options:
                 logging.debug(f"total step {i} time: {time.time() - last_time}")
                 last_time: float = time.time()
                 i += 1
             first_step = False
-        return statistics.mean(step_losses)
+        return statistics.mean(step_losses) if step_losses else float("nan")
 
     def offline_validation(self):
         """Only validate model (same as in training_loop but called externally / without train)"""
@@ -1356,9 +1496,8 @@ class ImageToImageNNTraining(ImageToImageNN):
         # compute loss
         masked_proc_output = processed_output * mask
         masked_proc_gt = processed_gt * mask
-        loss = self.lossf(masked_proc_output, masked_proc_gt) * vars(self).get(
-            "train_lambda", 1.0
-        )
+        loss = self.lossf(masked_proc_output, masked_proc_gt)
+        loss = loss * vars(self).get("train_lambda", 1.0)
         # penalize exposure difference
         # approx_exposure_diff = (
         #     #    masked_proc_output.mean() - masked_proc_gt.mean()
@@ -1440,18 +1579,8 @@ class PRGBImageToImageNNTraining(ImageToImageNNTraining):
         # last_time = time.time()
         model_output = self.model(batch["y_crops"])
 
-        if isinstance(self, DenoiseCompressTraining):
-            if "spam" in self.debug_options and random.random() < 0.01:
-                logging.debug(
-                    f"DBG: {model_output['used_dists']=}, {model_output['num_forced_dists']=}"
-                )
-            reconstructed_image, bpp = (
-                model_output["reconstructed_image"],
-                model_output["bpp"],
-            )
-        else:
-            reconstructed_image = model_output
-            bpp = 0
+        reconstructed_image = model_output
+        bpp = 0
         # if self.exposure_diff_penalty > 0:
         #     approx_exposure_diff = self.compute_approx_exposure_diff(
         #         batch["x_crops"],
@@ -1555,8 +1684,6 @@ class PRGBImageToImageNNTraining(ImageToImageNNTraining):
         loss.backward()
         # print(f"backward time: {time.time()-last_time}")
         # last_time = time.time()
-        if isinstance(self, DenoiseCompressTraining):
-            DenoiseCompressTraining.clip_gradient(optimizer, 5)
         optimizer.step()
         # print(f"optimizer time: {time.time()-last_time}")
         # last_time = time.time()
@@ -1646,6 +1773,32 @@ class BayerImageToImageNN(ImageToImageNN):
             )
         return output_images
 
+    @staticmethod
+    def normalize_iso(iso, device=None, dtype=torch.float32) -> torch.Tensor:
+        iso = torch.as_tensor(iso, device=device, dtype=dtype)
+        if not torch.isfinite(iso).all() or (iso <= 0).any():
+            raise ValueError(f"ISO values must be finite and positive, got {iso}")
+        return (torch.log2(iso / 100.0) / 9.0).clamp(0.0, 1.0)
+
+    def forward_model(self, img: torch.Tensor, batch=None):
+        if not vars(self).get("iso_conditioning", False):
+            return self.model(img)
+        if batch is None or batch.get("iso") is None:
+            raise ValueError("ISO metadata is required by this model")
+        iso = torch.as_tensor(batch["iso"], device=img.device, dtype=img.dtype)
+        if iso.ndim == 0:
+            iso = iso.repeat(img.shape[0])
+        if iso.shape[0] != img.shape[0]:
+            raise ValueError(
+                f"ISO batch size {iso.shape[0]} does not match image batch {img.shape[0]}"
+            )
+        return self.model(
+            img,
+            conditioning=self.normalize_iso(
+                iso, device=img.device, dtype=img.dtype
+            ),
+        )
+
     def add_arguments(self, parser):
         super().add_arguments(parser)
 
@@ -1653,6 +1806,11 @@ class BayerImageToImageNN(ImageToImageNN):
             "--preupsample",
             action="store_true",
             help="Upsample bayer image before processing it.",
+        )
+        parser.add_argument(
+            "--iso_conditioning",
+            action="store_true",
+            help="Append normalized log2 ISO as a constant U-Net input channel.",
         )
 
 
@@ -1701,6 +1859,15 @@ class BayerImageToImageNNTraining(ImageToImageNNTraining, BayerImageToImageNN):
             repacked_batch["rgb_xyz_matrix"].shape[0]
             == repacked_batch["x_crops"].shape[0]
         )
+        if "iso" in batch[0] or "iso" in batch[1]:
+            if "iso" not in batch[0] or "iso" not in batch[1]:
+                raise ValueError("ISO metadata must be present in both training batches")
+            repacked_batch["iso"] = torch.cat(
+                (
+                    batch[0]["iso"].repeat_interleave(num_crops_per_image),
+                    batch[1]["iso"].repeat_interleave(num_crops_per_image),
+                )
+            ).to(device)
         return repacked_batch
 
     def step(
@@ -1719,15 +1886,9 @@ class BayerImageToImageNNTraining(ImageToImageNNTraining, BayerImageToImageNN):
         if "timing" in self.debug_options or "spam" in self.debug_options:
             last_time = time.time()
 
-        model_output = self.model(batch["y_crops"])
-        if isinstance(self, DenoiseCompressTraining):
-            reconstructed_image, bpp = (
-                model_output["reconstructed_image"],
-                model_output["bpp"],
-            )
-        else:
-            reconstructed_image = model_output
-            bpp = 0
+        model_output = self.forward_model(batch["y_crops"], batch)
+        reconstructed_image = model_output
+        bpp = 0
         if "timing" in self.debug_options or "spam" in self.debug_options:
             logging.debug(f"model time: {time.time() - last_time}")
             last_time = time.time()
@@ -1836,8 +1997,6 @@ class BayerImageToImageNNTraining(ImageToImageNNTraining, BayerImageToImageNN):
             last_time = time.time()
         optimizer.zero_grad()
         loss.backward()
-        if isinstance(self, DenoiseCompressTraining):
-            DenoiseCompressTraining.clip_gradient(optimizer, 5)
         # print(f"backward time: {time.time()-last_time}")
         # last_time = time.time()
 
@@ -1934,136 +2093,15 @@ class BayerImageToImageNNTraining(ImageToImageNNTraining, BayerImageToImageNN):
         # )
 
 
-class DenoiseCompress(ImageToImageNN):
-    MODELS_BASE_DPATH = os.path.join("..", "..", "models", "rawnind_dc")
-    ARCHS = {
-        "ManyPriors": manynets_compression.ManyPriors_RawImageCompressor,
-        "DenoiseThenCompress": denoise_then_compress.DenoiseThenCompress,
-        "JPEGXL": standard_compressor.JPEGXL_ImageCompressor,
-        "JPEG": standard_compressor.JPEGXL_ImageCompressor,
-        "Passthrough": standard_compressor.Passthrough_ImageCompressor,
-    }
-    ARCHS_ENC = {
-        "Balle": compression_autoencoders.BalleEncoder,
-        # "BayerPreUp": compression_autoencoders.BayerPreUpEncoder,
-    }
-    ARCHS_DEC = {
-        "Balle": compression_autoencoders.BalleDecoder,
-        "BayerPS": compression_autoencoders.BayerPSDecoder,
-        "BayerTC": compression_autoencoders.BayerTCDecoder,
-    }
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def instantiate_model(self) -> None:
-        self.model: torch.nn.Module = self.ARCHS[self.arch](
-            in_channels=self.in_channels,
-            funit=self.funit,
-            device=self.device,
-            hidden_out_channels=self.hidden_out_channels,
-            bitstream_out_channels=self.bitstream_out_channels,
-            encoder_cls=self.ARCHS_ENC[self.arch_enc],
-            decoder_cls=self.ARCHS_DEC[self.arch_dec],
-            preupsample=vars(self).get("preupsample", False),
-        ).to(self.device)
-
-    def add_arguments(self, parser):
-        super().add_arguments(parser)
-        parser.add_argument(
-            "--arch_enc",
-            help="Encoder architecture",
-            required=True,
-            choices=self.ARCHS_ENC.keys(),
-        )
-        parser.add_argument(
-            "--arch_dec",
-            help="Decoder architecture",
-            required=True,
-            choices=self.ARCHS_DEC.keys(),
-        )
-        parser.add_argument("--hidden_out_channels", type=int)
-        parser.add_argument("--bitstream_out_channels", type=int)
-
-    def _get_resume_suffix(self) -> str:
-        return "combined" + self._get_lossn_extension()
-
-
-class BayerDenoiseCompress(DenoiseCompress, BayerImageToImageNN):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-
-class DenoiseCompressTraining(ImageToImageNNTraining, DenoiseCompress):
-    CLS_CONFIG_FPATHS = ImageToImageNN.CLS_CONFIG_FPATHS + [
-        os.path.join("config", "train_dc.yaml")
-    ]
-
-    def __init__(self, launch=False, **kwargs):
-        super().__init__(**kwargs)
-        try:
-            self.lossf = pt_losses.losses[
-                self.loss
-            ]()  # actually visual loss function, kept name for compatibility.
-        except KeyError:
-            raise NotImplementedError(f"{self.loss} not in common.pt_losses.losses")
-        assert (
-            len(self.optimizer.param_groups) == 3
-            or self.arch == "JPEGXL"
-            or self.arch == "Passthrough"
-        )  # match adjust_lr function
-        if launch:
-            self.training_loop()
-
-    def init_optimizer(self):
-        self.optimizer = torch.optim.Adam(
-            self.model.get_parameters(
-                lr=self.init_lr,
-                bitEstimator_lr_multiplier=self.bitEstimator_lr_multiplier,
-            ),
-            lr=self.init_lr,
-        )
-
-    def add_arguments(self, parser):
-        super().add_arguments(parser)
-        parser.add_argument(
-            "--train_lambda",
-            type=float,
-            required=True,
-            help="lambda for combined loss = lambda * visual_loss + bpp",
-        )
-        parser.add_argument(
-            "--bitEstimator_lr_multiplier",
-            type=float,
-            help="Multiplier for bitEstimator learning rate, compared to autoencoder.",
-        )
-        parser.add_argument(
-            "--loss",
-            help="Distortion loss function",
-            choices=pt_losses.losses.keys(),
-            required=True,
-        )
-
-    def _mk_expname(self, args: configargparse.Namespace) -> str:
-        return f"{type(self).__name__}_{args.in_channels}ch_L{args.train_lambda}_{args.arch_enc}_{args.arch_dec}"
-
-    @staticmethod
-    def clip_gradient(optimizer, grad_clip):
-        for group in optimizer.param_groups:
-            for param in group["params"]:
-                if param.grad is not None:
-                    param.grad.data.clamp_(-grad_clip, grad_clip)
-
-
 class Denoiser(ImageToImageNN):
     MODELS_BASE_DPATH = os.path.join("..", "..", "models", "rawnind_denoise")
     ARCHS = {
         "unet": raw_denoiser.UtNet2,
+        "nafnet": nafnet.NAFNet,
         "utnet3": raw_denoiser.UtNet3,
         # "runet": runet.Runet,
         "identity": raw_denoiser.Passthrough,
         # "edsr": edsr.EDSR,
-        "bm3d": bm3d_denoiser.BM3D_Denoiser,
     }
 
     def __init__(self, **kwargs):
@@ -2073,11 +2111,16 @@ class Denoiser(ImageToImageNN):
         return self.loss + self._get_lossn_extension()
 
     def instantiate_model(self):
-        self.model: torch.nn.Module = self.ARCHS[self.arch](
+        model_kwargs = dict(
             in_channels=self.in_channels,
             funit=self.funit,
             preupsample=vars(self).get("preupsample", False),
-        ).to(self.device)
+        )
+        if vars(self).get("iso_conditioning", False):
+            model_kwargs["conditioning_channels"] = 1
+        self.model: torch.nn.Module = self.ARCHS[self.arch](**model_kwargs).to(
+            self.device
+        )
 
     def add_arguments(self, parser):
         super().add_arguments(parser)
@@ -2103,7 +2146,7 @@ class DenoiserTraining(ImageToImageNNTraining, Denoiser):
         super().__init__(**kwargs)
 
         try:
-            self.lossf = pt_losses.losses[self.loss]()
+            self.lossf = pt_losses.losses[self.loss]().to(self.device)
         except KeyError:
             raise NotImplementedError(f"{self.loss} not in common.pt_losses.losses")
 
@@ -2140,7 +2183,7 @@ class DenoiserTraining(ImageToImageNNTraining, Denoiser):
 def get_and_load_test_object(
     **kwargs,
 ) -> ImageToImageNN:  # only used in denoise_image.py
-    """Parse config file or arch parameter to get the class name, ie Denoiser or DenoiseCompress."""
+    """Load a Bayer or profiled-RGB denoiser from its configuration."""
     parser = configargparse.ArgumentParser(
         description=__doc__,
         config_file_parser_class=configargparse.YAMLConfigFileParser,
@@ -2156,7 +2199,7 @@ def get_and_load_test_object(
         "--arch",
         help="Model architecture",
         required=True,
-        choices=Denoiser.ARCHS.keys() | DenoiseCompress.ARCHS.keys(),
+        choices=Denoiser.ARCHS.keys(),
     )
     parser.add_argument(
         "--in_channels",
@@ -2171,11 +2214,6 @@ def get_and_load_test_object(
             test_obj = BayerDenoiser(test_only=True, **kwargs)
         else:
             test_obj = Denoiser(test_only=True, **kwargs)
-    elif args.arch in DenoiseCompress.ARCHS.keys():
-        if args.in_channels == 4:
-            test_obj = BayerDenoiseCompress(test_only=True, **kwargs)
-        else:
-            test_obj = DenoiseCompress(test_only=True, **kwargs)
     else:
         raise NotImplementedError(f"Unknown architecture {args.arch}")
     # if "output_valtest_images" not in test_obj.debug_options:

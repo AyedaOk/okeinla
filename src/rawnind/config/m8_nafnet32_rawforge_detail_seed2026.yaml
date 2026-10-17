@@ -1,0 +1,102 @@
+arch: nafnet
+funit: 32
+loss: rawforge_detail_loss
+metrics:
+  - msssim_loss
+  - mse
+
+crop_size: 256
+val_crop_size: 1024
+test_crop_size: 1024
+num_crops_per_image: 4
+batch_size_clean: 0
+batch_size_noisy: 4
+
+init_lr: 0.00001
+tot_steps: 2925000
+val_interval: 5000
+test_interval: 1000000000
+patience: 100000
+lr_multiplier: 0.85
+warmup_nsteps: 0
+
+transfer_function: None
+transfer_function_valtest: None
+match_gain: output
+data_pairing: x_y
+bayer_only: true
+load_path: ../../models/rawnind_denoise/m5b_nafnet32_rawforge_mixed_seed2026/saved_models/iter_2915000.pt
+reset_optimizer: true
+
+noise_dataset_yamlfpaths:
+  - ../../datasets/RawNIND/RawNIND_masks_and_alignments.yaml
+  - ../../datasets/RawNIND_Perso2/RawNIND_Perso2_masks_and_alignments.yaml
+
+seed: 2026
+deterministic: false
+
+val_reserve:
+  - Scene_0001
+  - Scene_0008
+  - Scene_0027
+  - Scene_0032
+  - Scene_0044
+  - Scene_0047
+  - Scene_0054
+  - Scene_0069
+  - Scene_0084
+  - Scene_0094
+  - Scene_0101
+  - 7D-4
+  - D60-3
+  - Elplint
+  - Iain01
+  - Iain02
+  - Leslie_squares_and_heart_universe
+  - Metalldel
+  - MuseeL-AraBleu-cropped-A7C
+  - MuseeL-KoenraadTinel-JeuneFilleAVelo-A7C
+  - MuseeL-ambon-A7C
+  - MuseeL-birdsandfaces-closeup-A7C
+  - MuseeL-horseface-A7C
+  - MuseeL-pedestal-A7C
+  - MuseeL-sol-A7C-brighter
+  - RB1850X
+  - UNK_LucieB_3apples
+  - UNK_TEST_LucieB_groceries
+  - drying_apple_seeds
+  - kimiko
+  - wool_remotes
+
+test_reserve:
+  - Scene_0004
+  - Scene_0015
+  - Scene_0030
+  - Scene_0050
+  - Scene_0051
+  - Scene_0053
+  - Scene_0075
+  - Scene_0076
+  - Scene_0085
+  - Scene_0095
+  - Scene_0104
+  - Kyckling-i-kruka
+  - MuseeL-DeutschesLandschwein-A7C
+  - MuseeL-birdsandfaces-MuseeL
+  - MuseeL-colorfulchemicalsandbird-A7C
+  - MuseeL-coral2-dark-A7C
+  - MuseeL-fercarbonyle-A7C
+  - MuseeL-inspiredlotus-closeup-A7C
+  - MuseeL-mask-A7C
+  - MuseeL-mushroomcandies-A7C
+  - MuseeL-redcoral-A7C
+  - MuseeL-skull2-A7C
+  - Spydercheckr
+  - big_bookshelf_1
+  - fire_starters
+  - mjbookshelf1
+  - mjbookshelf2
+  - plomberie
+  - tapedduct
+  - target
+  - wool_basket

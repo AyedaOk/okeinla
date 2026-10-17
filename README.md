@@ -1,37 +1,35 @@
-## Source Code for "Learning Joint Denoising, Demosaicing, and Compression from the Raw Natural Image Noise Dataset"
+# Okeinla
 
-This repository contains the source code used in the article "Learning Joint Denoising, Demosaicing, and Compression from the Raw Natural Image Noise Dataset".
+Okeinla is a Bayer RAW denoising and demosaicing model built on
+[RawNIND](https://github.com/trougnouf/rawnind_jddc) and NAFNet.
 
-This code is delivered as it was used throughout the years of research, in an "academic" state (as-is). There has not been an effort to clean up the code and make it more presentable.
+- [Model weights and application packages](https://huggingface.co/AyedaOk/okeinla)
+- [Okeinla dataset](https://huggingface.co/datasets/AyedaOk/okeinla-dataset)
 
-For more detailed information about the project, please see the main README file located at [src/rawnind/README.md](src/rawnind/README.md).
+## Setup
 
-A simpler, cleaner public repository focusing on denoising-only is planned for the relatively near future.
+Use Python 3.13 or newer and [uv](https://docs.astral.sh/uv/):
 
-### Downloading the RawNIND Dataset
-
-If you just want to download the RawNIND dataset, you can use the following command:
-
-```bash
-curl -s "https://dataverse.uclouvain.be/api/datasets/:persistentId/?persistentId=doi:10.14428/DVN/DEQCIM" | jq -r '.data.latestVersion.files[] | "wget -c -O \"\(.dataFile.filename)\" https://dataverse.uclouvain.be/api/access/datafile/\(.dataFile.id)"' | bash
+```sh
+uv sync
+cd src/rawnind
+export OPENCV_IO_ENABLE_OPENEXR=1
 ```
 
-### Pre-trained models
+Run training and tools from `src/rawnind`.
 
-Pre-trained models are available through the following link: https://drive.google.com/drive/folders/12Uc5sT4OWx02sviUS_boDk1zDSDRVorw?usp=sharing
+## Credits
 
-### Citation
+- **RawNIND:** Benoit Brummer and Christophe De Vleeschouwer,
+  *Learning Joint Denoising, Demosaicing, and Compression from the Raw Natural
+  Image Noise Dataset* (2025), [paper](https://arxiv.org/abs/2501.08924).
+- **RawForge / Restorer:** Okeinla uses a loss recipe derived from its
+  [training code](https://github.com/rymuelle/Restorer).
+- **NAFNet:** Liangyu Chen, Xiaojie Chu, Xiangyu Zhang, and Jian Sun,
+  *Simple Baselines for Image Restoration* (ECCV 2022),
+  [code](https://github.com/megvii-research/NAFNet).
 
-You can cite the "Learning Joint Denoising, Demosaicing, and Compression from the Raw Natural Image Noise Dataset" paper as follows:
+## License
 
-```bibtex
-@misc{brummer2025learningjointdenoisingdemosaicing,
-	  title={Learning Joint Denoising, Demosaicing, and Compression from the Raw Natural Image Noise Dataset},
-	  author={Benoit Brummer and Christophe De Vleeschouwer},
-	  year={2025},
-	  eprint={2501.08924},
-	  archivePrefix={arXiv},
-	  primaryClass={cs.CV},
-	  url={https://arxiv.org/abs/2501.08924},
-}
-```
+Code and model weights: GPLv3. Okeinla and RawNIND datasets: CC BY-SA 4.0.
+See [LICENSE](LICENSE) and the [NAFNet MIT notice](licenses/NAFNet-MIT.txt).
