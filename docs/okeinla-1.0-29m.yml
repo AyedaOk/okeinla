@@ -1,0 +1,69 @@
+framework:
+  name: Model Openness Framework
+  version: '1.0'
+  date: '2024-12-15'
+release:
+  name: Okeinla-1.0-29M
+  date: '2026-11-20'
+  producer: Ayeda Okambawa
+  repository: https://github.com/AyedaOk/okeinla
+  huggingface: https://huggingface.co/AyedaOk/okeinla
+  license:
+    distribution:
+      name: GPL-3.0-only
+      path: https://huggingface.co/AyedaOk/okeinla/blob/main/LICENSE
+    code:
+      name: GPL-3.0-only
+      path: https://github.com/AyedaOk/okeinla/blob/okeinla-1.0/LICENSE
+  components:
+    - name: Model architecture
+      description: Well commented code for the model's architecture
+      component_path: https://github.com/AyedaOk/okeinla/blob/e4eeeae/src/rawnind/models/nafnet.py
+    - name: Data preprocessing code
+      description: Code for data cleansing, normalization, and augmentation
+      component_path: https://github.com/AyedaOk/okeinla/blob/e4eeeae/src/rawnind/tools/crop_datasets.py
+    - name: Training code
+      description: Code used for training the model
+      component_path: https://github.com/AyedaOk/okeinla/blob/e4eeeae/src/rawnind/train_denoiser_bayer2prgb.py
+    - name: Inference code
+      description: Code used for running the model
+      component_path: https://github.com/AyedaOk/okeinla/blob/e4eeeae/src/rawnind/tools/denoise_image.py
+    - name: Evaluation code
+      description: Code used for evaluating the model
+      component_path: https://github.com/AyedaOk/okeinla/tree/e4eeeae/benchmark
+    - name: Supporting libraries and tools
+      description: Libraries and tools used in the model's development
+      component_path: https://github.com/AyedaOk/okeinla/blob/e4eeeae/src/rawnind/tools/export_darktable_model.py
+    - name: Model parameters (Final)
+      description: Trained model parameters, weights and biases
+      component_path: https://huggingface.co/AyedaOk/okeinla/blob/7d4480d305ac9a425832afb9c110ee0b1af0200a/pytorch/iter_2940000.pt
+    - name: Datasets
+      description: Training, validation and testing datasets used for the model
+      license: CC-BY-SA-4.0
+      license_path: https://creativecommons.org/licenses/by-sa/4.0/
+      component_path: https://huggingface.co/AyedaOk/okeinla#license-and-credits
+    - name: Evaluation data
+      description: Data used for evaluating the model
+      license: CC-BY-SA-4.0
+      license_path: https://creativecommons.org/licenses/by-sa/4.0/
+      component_path: https://huggingface.co/datasets/AyedaOk/rawbench-dataset/tree/978c222c700b2dda9b4aa96af5fc54dad1fa6e87
+    - name: Model metadata
+      description: Any model metadata including training configuration and optimizer states
+      component_path: https://huggingface.co/AyedaOk/okeinla/blob/7d4480d305ac9a425832afb9c110ee0b1af0200a/pytorch/iter_2940000.pt.opt
+    - name: Model card
+      description: Model details including performance metrics, intended use, and limitations
+      component_path: https://huggingface.co/AyedaOk/okeinla
+    - name: Data card
+      description: Documentation for datasets including source, characteristics, and preprocessing details
+      license: CC-BY-SA-4.0
+      license_path: https://creativecommons.org/licenses/by-sa/4.0/
+      component_path: https://huggingface.co/datasets/AyedaOk/okeinla-dataset
+    - name: Technical report
+      description: Technical report detailing capabilities and usage instructions for the model
+      component_path: https://github.com/AyedaOk/darktable-ai/blob/6270d63/models/rawdenoise-okeinla/README.md#technical-report
+    - name: Research paper
+      description: Research paper detailing the development and capabilities of the model
+      component_path: https://github.com/AyedaOk/darktable-ai/blob/6270d63/models/rawdenoise-okeinla/README.md#technical-report
+    - name: Evaluation results
+      description: The results from evaluating the model
+      component_path: https://github.com/AyedaOk/darktable-ai/blob/6270d63/models/rawdenoise-okeinla/README.md#evaluation-and-limits
